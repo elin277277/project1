@@ -1,0 +1,39 @@
+# Local builds and editor state
+**/build/
+**/build-*/
+**/CMakeFiles/
+**/CMakeCache.txt
+**/compile_commands.json
+*.elf
+*.hex
+*.bin
+*.map
+*.su
+.DS_Store
+.vscode/
+.idea/
+# Existing submission repository build rules
+*.d
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+*.exe
+*.out
+*.pdb
+*.tmp
+*.log
+*.bak
+*.swp
+Testing/
+.cache/
+vcpkg_installed/
+# CubeMX temporary artifacts
+**/MXTmpFiles/
+*_save
+# Local credentials must never be committed
+.env
+.env.*
+*.pem
+*.key

@@ -1,0 +1,8 @@
+# CubeMX and vendor files retain upstream line endings; hand-written files use LF.
+*.cpp text eol=lf
+*.hpp text eol=lf
+*.md text eol=lf
+*.sh text eol=lf
+# Generated/vendor CRLF and upstream trailing spaces are not handwritten edits.
+board/** whitespace=cr-at-eol
+board/Drivers/** -whitespace
