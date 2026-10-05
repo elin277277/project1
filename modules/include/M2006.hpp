@@ -1,39 +1,31 @@
-//
-// Created by cosmosmount on 2025/8/30.
-//
-
 #ifndef RM26_M2006_HPP
 #define RM26_M2006_HPP
 
 #include "DJIMotor.hpp"
 
-/**
- * @class M2006
- * @brief M2006电机的控制类，继承自Motor类。
- *
- * 这个类实现了M2006电机的控制方法，包括输出设置等。
- */
+// M2006 + C610 protocol EXAMPLE only. Other motors/ESCs need explicit protocol
+// review, not a gearbox enum. Configuration comes from the parent service's
+// app_config; this module never includes service configuration or platform code.
 class M2006 final : public DJIMotor
 {
 public:
-    /**
-     * @brief 构造函数，初始化M2006电机控制类。
-     */
-    M2006();
-
-    /**
-     * @brief 析构函数。
-     */
+    struct Config
+    {
+        float reduction{};          // 改成实际电机：rotor/output-shaft ratio, must be > 0.
+        uint16_t currentLimit{};    // 改成实际电机：C610 counts, 0 by default, maximum 10000.
+        uint32_t feedbackTimeoutMs{}; // 改成实际电机：explicit, nonzero timeout < 2^31 ms.
+    };
+    // No implicit reduction/timeout. Missing/invalid configuration cannot register.
+    // Gains default to ZERO, not tuned values. Always starts in RELAX_MODE.
+    explicit M2006(Config config);
     ~M2006() override = default;
+    using DJIMotor::setOutput;
+    using DJIMotor::AliveCheck;
+    void setOutput(float dtSeconds, uint32_t nowMs) override;
+    MotorStateTypedef AliveCheck(uint32_t nowMs) override;
 
-    /**
-     * @brief 实现电机输出设置。
-     * 根据当前的控制模式和PID反馈调整电机输出。
-     * 必须在派生类中具体实现此方法以适应具体电机。
-     */
-    void setOutput() override;
-
-    MotorStateTypedef AliveCheck() override;
+private:
+    MotorControlModeType previousMode_{RELAX_MODE};
 };
 
-#endif //RM26_M2006_HPP
+#endif // RM26_M2006_HPP

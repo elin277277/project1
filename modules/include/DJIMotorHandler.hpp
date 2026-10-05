@@ -2,60 +2,40 @@
 #define DJIMOTORHANDLER_HPP
 
 #include "DJIMotor.hpp"
+#include "bsp_ports.hpp"
 
-/**
- * @brief 电机控制类
- */
+// Owns no platform resources. The service owns port start/stop and scheduling.
+// Port contexts, this handler, and registered motors must outlive all callbacks.
 class DJIMotorHandler
 {
 public:
-    /**
-     *@brief 使用指针数组, 2个CAN口，每个CAN口最多8个电机
-     */
-    DJIMotor *DJIMotorList[2][8]{};
+    explicit DJIMotorHandler(bsp::CanPort bus0, bsp::CanPort bus1 = {});
+    DJIMotorHandler(const DJIMotorHandler &) = delete;
+    DJIMotorHandler &operator=(const DJIMotorHandler &) = delete;
 
-    uint8_t can1_send_data_0[8]{}; // CAN1电机控制数据，用于控制0x201-0x204
-    uint8_t can1_send_data_1[8]{}; // CAN1电机控制数据，用于控制0x205-0x208
+    // Startup-only: bus 0/1, C610 feedback IDs 0x201..0x208. Reject duplicates,
+    // invalid configuration, missing send port, and motors owned by another handler.
+    bool registerMotor(DJIMotor *motor, unsigned bus, uint16_t canId);
+    // Call AFTER registration and BEFORE CanPort.start. No registration thereafter.
+    void sealRegistration() { registrationSealed_ = true; }
+    static void receiveBus0(void *context, const bsp::CanFrame &frame, uint32_t timestampMs);
+    static void receiveBus1(void *context, const bsp::CanFrame &frame, uint32_t timestampMs);
+    // Bounded RX entry (one serialized writer per bus); never touches PID/public state.
+    // Malformed frames addressed to registered motors invalidate their feedback.
+    bool updateFeedback(unsigned bus, const bsp::CanFrame &frame, uint32_t timestampMs);
 
-    uint8_t can2_send_data_0[8]{}; // CAN2电机控制数据，用于控制0x201-0x204
-    uint8_t can2_send_data_1[8]{}; // CAN2电机控制数据，用于控制0x205-0x208
+    // Control-thread only. Sends occupied 0x200/0x1ff groups, unused slots zero.
+    // Revalidates fault epochs immediately before each send. A frame accepted by
+    // the transport cannot be recalled; faults in/after send take effect next tick.
+    // Failure relaxes ALL motors and tries zero once per occupied group, no waits.
+    bool sendControlData(uint32_t nowMs);
+    void AllMotorAliveCheck(uint32_t nowMs);
 
-    // 四个标志位，用于判断是否需要发送控制数据
-    bool CAN1_0x200_Exist = false; // CAN1是否存在控制报文为0x200电机
-    bool CAN1_0x1FF_Exist = false; // CAN1是否存在控制报文为0x1FF电机
-    bool CAN2_0x200_Exist = false; // CAN2是否存在控制报文为0x200电机
-    bool CAN2_0x1FF_Exist = false; // CAN2是否存在控制报文为0x1FF电机
-
-    /**
-     * @brief 注册电机，将电机指针存入MotorList中
-     * @param DJImotor 电机指针
-     * @param hcan CAN句柄
-     * @param canId 电机ID
-     */
-    void registerMotor(DJIMotor *DJImotor, CAN_HandleTypeDef *hcan, uint16_t canId); // 使用指针作为参数
-
-    /**
-     * @brief 发送控制数据
-     */
-    void sendControlData();
-
-    /**
-     * @brief 处理并更新电机反馈数据
-     * @param hcan CAN 句柄
-     * @param rx_data 反馈数据
-     * @param index 电机索引
-     */
-    void updateFeedback(CAN_HandleTypeDef *hcan, uint8_t *rx_data, int index);
-
-    void AllMotorAliveCheck();
-
-    void UpdateSensorData(DJIMotor *motor, uint8_t *can_receive_data);
-
-    static DJIMotorHandler *Instance()
-    {
-        static DJIMotorHandler instance;
-        return &instance;
-    }
+private:
+    bsp::CanPort ports_[2];
+    DJIMotor *motors_[2][8]{};
+    bool registrationSealed_{};
+    void RelaxAll();
 };
 
 #endif // DJIMOTORHANDLER_HPP

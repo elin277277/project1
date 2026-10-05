@@ -2,109 +2,92 @@
 #define DJIMOTOR_HPP
 
 #include "pid.hpp"
-#include "can.h"
+#include <atomic>
+#include <cstdint>
 
-enum GearBox
-{
-    GearBox_None = 0,  ///< 无减速箱
-    GearBox_M2006 = 1, ///< M2006减速箱
-    GearBox_M3508 = 2, ///< M3508减速箱
-    GearBox_XRoll = 3  ///< XRoll减速箱
-};
+class DJIMotorHandler;
 
-/**
- * @class DJIMotor
- * @brief 电机控制类，提供电机的基本控制功能。
- *
- * 保留速度、位置控制所需的状态；控制计算由派生类完成。
- */
+// C610 protocol support for the M2006 example, NOT a universal DJI motor driver.
+// Register lifetime-stable motors before starting CAN RX. Only the control
+// thread accesses public state/PIDs; the RX callback writes an atomic mailbox.
 class DJIMotor
 {
 public:
-    /**
-     * @enum MotorControlModeType
-     * @brief 描述电机的不同控制模式。
-     */
-    enum MotorControlModeType
-    {
-        RELAX_MODE = 0,         ///< 电机松开模式，所有输出均为0。
-        SPD_MODE = 1,           ///< 速度模式，控制电机速度。
-        POS_MODE = 2            ///< 位置模式，控制电机到特定位置。
-    };
+    enum MotorControlModeType { RELAX_MODE = 0, SPD_MODE = 1, POS_MODE = 2 };
+    enum MotorStateTypedef { MOTOR_OFFLINE = 0, MOTOR_ONLINE = 1 };
+    static constexpr uint16_t protocolCurrentLimit = 10000;
 
-    enum MotorStateTypedef
-    {
-        MOTOR_OFFLINE = 0,
-        MOTOR_ONLINE = 1
-    };
-
-    /**
-     * @struct MotorFeedBack
-     * @brief 电机反馈数据的结构体，包括电机的各种物理量反馈。
-     * 结构体中包含了电机的电流、速度、位置等信息，以及电机的温度等状态反馈。
-     */
     struct MotorFeedBack
     {
-        int16_t last_ecd;      ///< 上次电机编码器的读数
-        uint16_t ecd;          ///< 当前电机编码器的读数
-        int16_t speed_rpm;     ///< 电机的转速，单位rpm
-        float currentFdb;    ///< 电机电流反馈
-        float speedFdb;        ///< 电机当前速度反馈, 单位rad/s
-        float lastSpeedFdb;    ///< 上次记录的电机速度
-        float positionFdb;     ///< 电机当前位置反馈
-        float lastPositionFdb; ///< 上次记录的电机位置
-        float temperatureFdb;  ///< 电机温度反馈
+        int16_t last_ecd{};
+        uint16_t ecd{};
+        int16_t speed_rpm{};     // Rotor rpm, not output-shaft rpm.
+        float currentFdb{};      // Signed C610 feedback counts, NOT amperes.
+        float speedFdb{};        // Output shaft rad/s, using configured reduction.
+        float lastSpeedFdb{};
+        float positionFdb{};     // Multi-turn output shaft rad, first frame is origin.
+        float lastPositionFdb{};
+        float temperatureFdb{};  // C610 has no temperature field; remains zero.
+        int32_t roundCount{};    // Signed rotor turns since initial encoder frame.
     };
 
-    MotorStateTypedef MotorState;
-    MotorControlModeType controlMode; ///< 当前电机控制模式
-    MotorFeedBack motorFeedback;      ///< 处理后的电机的反馈数据
-    uint16_t canId;                   ///< 电机的CAN通信ID
-    CAN_HandleTypeDef *hcan;          ///< 指向电机使用的CAN接口的指针
+    MotorStateTypedef MotorState{MOTOR_OFFLINE};
+    MotorControlModeType controlMode{RELAX_MODE};
+    MotorFeedBack motorFeedback{};
+    uint16_t canId{};            // Registration metadata; do not change after registration.
+    unsigned busIndex{2};
+    PID speedPid{0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    PID positionPid{0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    float speedSet{};            // Output shaft rad/s.
+    float positionSet{};         // Multi-turn output shaft rad, NOT wrapped to +/-pi.
+    int16_t currentSet{};        // C610 command counts; updated by setOutput().
+    uint16_t maxCurrent{};       // May lower, but never raise constructor safety limit.
+    uint32_t AliveFlag{}, Pre_AliveFlag{};
 
-    PID speedPid = PID(0.0f, 0.0f, 0.0f, 0.0f, 0.0f, PID_POSITION); ///< TODO: 配置速度环参数
-    PID positionPid = PID(0.0f, 0.0f, 0.0f, 0.0f, 0.0f, PID_POSITION); ///< TODO: 配置位置环参数
-
-    float speedSet;    ///< 设定的目标速度
-    float positionSet; ///< 设定的目标位置，范围[-Π, Π]
-
-    int16_t currentSet;  ///< 设定的电流输出
-    uint16_t maxCurrent; ///< 最大电流限制
-
-    uint32_t AliveFlag;
-    uint32_t Pre_AliveFlag;
-
-    GearBox gearBox;
-    /**
-     * @brief 纯虚函数，用于设置电机输出。
-     * 必须在派生类中实现此函数。
-     */
-    virtual void setOutput() = 0;
-
-    virtual MotorStateTypedef AliveCheck() = 0;
-
+    virtual void setOutput(float dtSeconds, uint32_t nowMs) = 0;
+    virtual MotorStateTypedef AliveCheck(uint32_t nowMs) = 0;
+    // Missing timing information must fail closed; use the explicit overloads.
+    virtual void setOutput() { Relax(); }
+    virtual MotorStateTypedef AliveCheck() { Relax(); return MotorState = MOTOR_OFFLINE; }
+    void Relax();
+    bool configurationValid() const { return configurationValid_; }
+    uint32_t feedbackFaultEpoch() const { return mailbox_.faults.load(); }
     virtual ~DJIMotor() = default;
+    DJIMotor(const DJIMotor &) = delete;
+    DJIMotor &operator=(const DJIMotor &) = delete;
 
-    /**
-     * @brief 构造函数
-     */
-    DJIMotor()
+protected:
+    DJIMotor(float reduction, uint16_t currentLimit, uint32_t feedbackTimeoutMs);
+    bool RefreshFeedback(uint32_t nowMs);
+    uint16_t CurrentLimit() const;
+    uint32_t FeedbackTimeoutMs() const { return feedbackTimeoutMs_; }
+    void CommitOutput();
+
+private:
+    friend class DJIMotorHandler;
+    const float reduction_;
+    const uint16_t configuredCurrentLimit_;
+    const uint32_t feedbackTimeoutMs_;
+    const bool configurationValid_;
+    DJIMotorHandler *registeredHandler_{};
+    // Single RX writer per motor. Plain-data seqlocks would be a C++ data race;
+    // all shared values are atomic and readers make only one bounded attempt.
+    static_assert(ATOMIC_INT_LOCK_FREE == 2, "CAN RX requires lock-free 32-bit atomics");
+    struct Mailbox
     {
-        controlMode = RELAX_MODE;
-
-        speedSet = 0;
-        positionSet = 0;
-        currentSet = 0;
-
-        maxCurrent = 0;
-
-        motorFeedback = {};
-        canId = 0;
-        hcan = nullptr;
-        AliveFlag = Pre_AliveFlag = 0;
-        gearBox = GearBox_None;
-        MotorState = MOTOR_OFFLINE;
-    }
+        std::atomic<uint32_t> sequence{0}, encoderSpeed{0}, current{0};
+        std::atomic<uint32_t> turns{0}, origin{0}, timestamp{0}, faults{0}, valid{0};
+    } mailbox_;
+    bool writerInitialized_{};
+    uint16_t writerEncoder_{}, writerOrigin_{};
+    int32_t writerTurns_{};
+    uint32_t writerTimestamp_{};
+    uint32_t observedFaults_{}, observedSequence_{};
+    bool outputReady_{};
+    uint32_t outputFaults_{};
+    MotorControlModeType outputMode_{RELAX_MODE};
+    bool PublishFeedback(const uint8_t *data, uint32_t nowMs, bool valid);
+    bool OutputSafe(uint32_t nowMs) const;
 };
 
-#endif //DJIMOTOR_HPP
+#endif // DJIMOTOR_HPP

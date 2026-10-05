@@ -1,227 +1,245 @@
 #include "BMI088.hpp"
-#include "tx_api.h"
-#include "bsp_pwm.hpp"
-#include <cmath>
 
-namespace BMI088
-{
-    /**
-     * @brief BMI088 acc gyro 标定
-     * @note 标定后的陀螺仪零偏存储在 Gyro_offset 中。
-     * @attention 不管工作模式是blocking还是IT,标定时都是blocking模式,所以不用担心中断关闭后无法标定(RobotInit关闭了全局中断)
-     * @attention 标定精度和等待时间有关。
-     * @todo 将标定次数(等待时间)变为参数供设定
-     * @section 整体流程为1.累加加速度数据计算gNrom()
-     *                   2.累加陀螺仪数据计算零飘
-     *                   3. 如果标定过程运动幅度过大,重新标定
-     *                   4.保存标定参数
-     */
-    void cBMI088::Calibrate()
-    {
-        const int calib_samples = 4000; // 采样次数
-        float gyro_sum[3] = {0.0f, 0.0f, 0.0f};
-        gyro_data_t temp_gyro;
+namespace {
+constexpr uint32_t kTransferTimeoutMs = 10;
+constexpr uint32_t kConfigBudgetMs = 1000;
+constexpr uint32_t kUpdateBudgetMs = 30;
+constexpr uint8_t kChipId = 0x00;
+constexpr uint8_t kAccelChipId = 0x1E;
+constexpr uint8_t kGyroChipId = 0x0F;
+constexpr uint8_t kAccelData = 0x12;
+constexpr uint8_t kGyroData = 0x02;
+constexpr uint8_t kTemperature = 0x22;
+constexpr uint8_t kAccelConf = 0x40;
+constexpr uint8_t kAccelRange = 0x41;
+constexpr uint8_t kAccelPowerConf = 0x7C;
+constexpr uint8_t kAccelPowerCtrl = 0x7D;
+constexpr uint8_t kAccelReset = 0x7E;
+constexpr uint8_t kGyroRange = 0x0F;
+constexpr uint8_t kGyroBandwidth = 0x10;
+constexpr uint8_t kGyroPower = 0x11;
+constexpr uint8_t kGyroReset = 0x14;
+constexpr uint8_t kResetCommand = 0xB6;
+// ACC_CONF: reserved bit7=1, normal BWP=2 in bits6:4, ODR400=0x0A.
+// Bosch BMI088 datasheet / official BMI08x definitions: normal BW nibble=0xA.
+// https://raw.githubusercontent.com/boschsensortec/BMI08x_SensorAPI/master/bmi08_defs.h
+constexpr uint8_t kAccel400HzNormal = 0x80 | (0x02 << 4) | 0x0A; // 0xAA, NOT 0xAB (800Hz).
+constexpr uint8_t kGyro400Hz47Hz = 0x03;
+constexpr float kAccelScale = (6.0f * 9.80665f) / 32768.0f;
+constexpr float kGyroScale = (2000.0f * 3.14159265358979323846f / 180.0f) / 32768.0f;
 
-        // 1. 清除旧的 Offset，防止叠加
-        Gyro_offset[0] = 0.0f;
-        Gyro_offset[1] = 0.0f;
-        Gyro_offset[2] = 0.0f;
-
-        // 2. 循环采样
-        for (int i = 0; i < calib_samples; i++)
-        {
-            ReadGyroData(&temp_gyro); // 这里读取的是原始值（因为Offset已清零）
-            gyro_sum[0] += temp_gyro.x;
-            gyro_sum[1] += temp_gyro.y;
-            gyro_sum[2] += temp_gyro.z;
-            
-            tx_thread_sleep(1); // 等待一个 ThreadX tick；实际耗时由 tick 频率决定。
-        }
-
-        // 3. 计算平均值作为零偏
-        Gyro_offset[0] = gyro_sum[0] / calib_samples;
-        Gyro_offset[1] = gyro_sum[1] / calib_samples;
-        Gyro_offset[2] = gyro_sum[2] / calib_samples;
-        
-        // 如果零偏过大（例如超过 0.1 rad/s），可能是在运动中标定的，应报错或丢弃
-        if (fabs(Gyro_offset[0]) > 0.1f || fabs(Gyro_offset[1]) > 0.1f || fabs(Gyro_offset[2]) > 0.1f)
-        {
-            self_test.CALIBRATE_ERR = true;
-            // 恢复默认值或保留上次值
-            Gyro_offset[0] = BMI088_GYRO_PRE_CALI_OFFSET_X; 
-            Gyro_offset[1] = BMI088_GYRO_PRE_CALI_OFFSET_Y;
-            Gyro_offset[2] = BMI088_GYRO_PRE_CALI_OFFSET_Z;
-        }
-        else
-        {
-            self_test.CALIBRATE_ERR = false;
-        }
+imu_status_t PortStatus(bsp::Status status) {
+    switch (status) {
+    case bsp::Status::ok: return imu_status_t::ok;
+    case bsp::Status::timeout: return imu_status_t::timeout;
+    case bsp::Status::busy: return imu_status_t::busy;
+    case bsp::Status::invalid: return imu_status_t::invalid_port;
+    case bsp::Status::not_ready:
+    case bsp::Status::io_error: return imu_status_t::transport_error;
     }
-
-    void cBMI088::TemperatureControl(float target_temp)
-    {
-        // TODO: 温度读取完成后，用 TempPid 计算加热占空比并限制到 [0, 1]。
-        // 未完成前保持加热关闭。
-        (void)target_temp;
-        PWM_SetDutyRatio(&HEATING_RESISTANCE_TIM, 0.0f, HEATING_RESISTANCE_CHANNEL);
-    }
-
-    void cBMI088::VerifyAccChipID()
-    {
-        uint8_t pRxData[2]; //< 读取两个字节，第一个是需要丢弃的无效字节，第二个是芯片 ID
-
-        ReadReg(BMI088_CS_ACC, ACC_CHIP_ID_ADDR, pRxData, 2); //< 读取加速度计chip id
-        tx_thread_sleep(1);
-        //< 如果chip id不等于预设值,则加速度计ID错误,初始化错误
-        if (pRxData[1] != ACC_CHIP_ID_VAL)
-        {
-            self_test.ACC_CHIP_ID_ERR = true;
-            self_test.INIT_ERR = true;
-        }
-        else if (pRxData[1] == ACC_CHIP_ID_VAL)
-        {
-            self_test.ACC_CHIP_ID_ERR = false;
-        }
-    }
-
-    void cBMI088::VerifyGyroChipID()
-    {
-        uint8_t pRxData;                                                 //< 读取一个字节,chip id
-        ReadReg(BMI088_CS_GYRO, GYRO_CHIP_ID_ADDR, &pRxData, 1); //< 读取陀螺仪chip id
-        tx_thread_sleep(1);
-        //< 如果chip id不等于预设值,则陀螺仪ID错误,初始化错误
-        if (pRxData != GYRO_CHIP_ID_VAL)
-        {
-            self_test.GYRO_CHIP_ID_ERR = true;
-            self_test.INIT_ERR = true;
-        }
-        else if (pRxData == GYRO_CHIP_ID_VAL)
-        {
-            self_test.GYRO_CHIP_ID_ERR = false;
-        }
-    }
-
-    void cBMI088::VerifyAccData()
-    {
-        // TODO: 检查加速度数据是否有效，并更新 ACC_DATA_ERR。
-    }
-
-    void cBMI088::VerifyGyroData()
-    {
-        // TODO: 检查角速度数据是否有效，并更新 GYRO_DATA_ERR。
-    }
-
-    void cBMI088::WriteReg(enum BMI088_SENSOR cs, uint8_t addr, uint8_t *data, uint8_t len)
-    {
-        // TODO: 根据 cs 拉低对应 GPIO 片选；按 SPI 写协议发送地址和数据，
-        // 最后释放片选，并处理通信失败与必要的延时。
-        (void)cs;
-        (void)addr;
-        (void)data;
-        (void)len;
-    }
-
-    void cBMI088::ReadReg(enum BMI088_SENSOR cs, uint8_t addr, uint8_t *data, uint8_t len)
-    {
-        // TODO: 根据 cs 拉低对应 GPIO 片选；按 SPI 读协议发送地址，
-        // 丢弃加速度计返回的首个无效字节，读取 len 字节并释放片选。
-        // 未实现前清零缓冲区，避免芯片 ID 校验读取未初始化数据。
-        (void)cs;
-        (void)addr;
-        if (data != nullptr)
-            for (uint8_t i = 0; i < len; ++i) data[i] = 0;
-    }
-
-    void cBMI088::Config()
-    {
-        tx_thread_sleep(10); //< 等待系统稳定
-
-        /*-------------------------------------加速度计初始化-------------------------------------*/
-        
-        //< 先软重启，清空所有寄存器
-        uint8_t pTxData;
-        pTxData = ACC_SOFTRESET_VAL;
-        WriteReg(BMI088_CS_ACC, ACC_SOFTRESET_ADDR, &pTxData, 1);
-        tx_thread_sleep(100); //< 延时100ms,重启需要时间
-
-        //< 打开加速度计电源
-        pTxData = ACC_PWR_CTRL_ON;
-        WriteReg(BMI088_CS_ACC, ACC_PWR_CTRL_ADDR, &pTxData, 1);
-        tx_thread_sleep(150);
-
-        //< 加速度计变成正常模式
-        pTxData = ACC_PWR_CONF_ACT;
-        WriteReg(BMI088_CS_ACC, ACC_PWR_CONF_ADDR, &pTxData, 1);
-        tx_thread_sleep(10); //
-
-        //< 测量范围
-        pTxData = ACC_RANGE_6G;
-        WriteReg(BMI088_CS_ACC, ACC_RANGE_ADDR, &pTxData, 1);
-        tx_thread_sleep(5); //< 延时5ms
-
-        pTxData = 0xAB;
-        WriteReg(BMI088_CS_ACC, ACC_CONF_ADDR, &pTxData, 1);
-        tx_thread_sleep(5); //< 延时5ms
-
-        pTxData = 0x08;
-        WriteReg(BMI088_CS_ACC, INT1_IO_CTRL_ADDR, &pTxData, 1);
-        tx_thread_sleep(5); //< 延时5ms
-
-        pTxData = 0x04;
-        WriteReg(BMI088_CS_ACC, INT_MAP_DATA_ADDR, &pTxData, 1);
-        tx_thread_sleep(5); //< 延时5ms
-
-        /*-------------------------------------陀螺仪初始化-------------------------------------*/
-        //< 先软重启，清空所有寄存器
-        pTxData = GYRO_SOFTRESET_VAL;
-        WriteReg(BMI088_CS_GYRO, GYRO_SOFTRESET_ADDR, &pTxData, 1);
-        tx_thread_sleep(100); //< 延时100ms,重启需要时间
-
-        pTxData = GYRO_RANGE_2000_DEG_S;
-        WriteReg(BMI088_CS_GYRO, GYRO_RANGE_ADDR, &pTxData, 1);
-        tx_thread_sleep(5); //< 延时5ms
-
-        pTxData = GYRO_ODR_2000Hz_BANDWIDTH_230Hz | GYRO_LPM1_SUS;
-        WriteReg(BMI088_CS_GYRO, GYRO_BANDWIDTH_ADDR, &pTxData, 1);
-        tx_thread_sleep(5); //< 延时5ms
-
-        pTxData = GYRO_LPM1_NOR;
-        WriteReg(BMI088_CS_GYRO, GYRO_LPM1_ADDR, &pTxData, 1);
-        tx_thread_sleep(5); //< 延时5ms
-
-        pTxData = GYRO_DRDY_ON;
-        WriteReg(BMI088_CS_GYRO, GYRO_INT_CTRL_ADDR, &pTxData, 1);
-        tx_thread_sleep(5); //< 延时5ms
-
-        pTxData = 0x00;
-        WriteReg(BMI088_CS_GYRO, GYRO_INT3_INT4_IO_CONF_ADDR, &pTxData, 1);
-        tx_thread_sleep(5); //< 延时5ms
-
-        pTxData = 0x01;
-        WriteReg(BMI088_CS_GYRO, GYRO_INT3_INT4_IO_MAP_ADDR, &pTxData, 1);
-        tx_thread_sleep(5); //< 延时5ms
-    }
-
-
-    void cBMI088::ReadAccData(acc_data_t *data)
-    {
-        // TODO: 按 BMI088 加速度计 SPI 协议丢弃首个无效字节，拼接三轴有符号原始值，
-        // 再按配置的量程换算为 m/s²，写入 data。
-        if (data != nullptr) *data = {};
-    }
-
-    void cBMI088::ReadGyroData(gyro_data_t *data)
-    {
-        // TODO: 读取并拼接陀螺仪三轴原始值，按配置量程换算为 rad/s，
-        // 减去 Gyro_offset 后写入 data。
-        if (data != nullptr) *data = {};
-    }
-
-    void cBMI088::ReadAccTemperature(float *temp)
-    {
-        // TODO: 丢弃加速度计读取时的首个无效字节，解析 11 位有符号温度并换算为摄氏度。
-        if (temp != nullptr) *temp = 0.0f;
-    }
-
+    return imu_status_t::transport_error;
 }
 
+// Explicit sign extension avoids implementation-defined unsigned->int16 casts.
+int32_t Signed16(const uint8_t *bytes) {
+    const int32_t value = static_cast<int32_t>(bytes[0]) |
+                          (static_cast<int32_t>(bytes[1]) << 8);
+    return (value & 0x8000) ? value - 65536 : value;
+}
+
+imu_vector3_t Vector(const uint8_t *bytes, float scale) {
+    return {Signed16(bytes) * scale, Signed16(bytes + 2) * scale,
+            Signed16(bytes + 4) * scale};
+}
+} // namespace
+
+namespace BMI088 {
+cBMI088::cBMI088(bsp::SpiDevice accel, bsp::SpiDevice gyro, bsp::Clock clock)
+    : accel_(accel), gyro_(gyro), clock_(clock) {}
+
+bool cBMI088::PortsValid() const {
+    // A null context is legal for a stateless callback; callbacks are mandatory.
+    return accel_.exchange && accel_.cs.write && gyro_.exchange && gyro_.cs.write &&
+           clock_.now_ms && clock_.sleep_ms;
+}
+
+void cBMI088::Deselect() {
+    if (accel_.cs.write) accel_.cs.write(accel_.cs.context, true);
+    if (gyro_.cs.write) gyro_.cs.write(gyro_.cs.context, true);
+}
+
+imu_status_t cBMI088::Fail(imu_status_t error) {
+    Deselect();
+    initialized_ = false;
+    status_ = error;
+    return error;
+}
+
+uint32_t cBMI088::RemainingMs() const {
+    const uint32_t elapsed = clock_.now_ms(clock_.context) - operation_start_ms_;
+    return elapsed < operation_budget_ms_ ? operation_budget_ms_ - elapsed : 0;
+}
+
+imu_status_t cBMI088::Delay(uint32_t ms) {
+    if (RemainingMs() <= ms) return imu_status_t::timeout;
+    clock_.sleep_ms(clock_.context, ms);
+    return RemainingMs() ? imu_status_t::ok : imu_status_t::timeout;
+}
+
+imu_status_t cBMI088::Exchange(const bsp::SpiDevice &device, const uint8_t *tx,
+                               uint8_t *rx, size_t size) {
+    const uint32_t remaining = RemainingMs();
+    if (!remaining) return imu_status_t::timeout;
+    const uint32_t timeout = remaining < kTransferTimeoutMs ? remaining : kTransferTimeoutMs;
+    device.cs.write(device.cs.context, false);
+    const bsp::Status result = device.exchange(device.context, tx, rx, size, timeout);
+    // Always release CS, including timeout, busy and partially completed transfers.
+    device.cs.write(device.cs.context, true);
+    if (result != bsp::Status::ok) return PortStatus(result);
+    return RemainingMs() ? imu_status_t::ok : imu_status_t::timeout;
+}
+
+imu_status_t cBMI088::Read(const bsp::SpiDevice &device, bool accel, uint8_t address,
+                           uint8_t *data, size_t size) {
+    // Private reads are at most XYZ (6 bytes). One exchange holds CS for address,
+    // accel-only dummy, and every data byte. MOSI clocks out zero after address.
+    if (!data || !size || size > 6) return imu_status_t::invalid_port;
+    uint8_t tx[8]{};
+    uint8_t rx[8]{};
+    tx[0] = address | 0x80;
+    const size_t prefix = accel ? 2 : 1;
+    const imu_status_t result = Exchange(device, tx, rx, size + prefix);
+    if (result == imu_status_t::ok)
+        for (size_t i = 0; i < size; ++i) data[i] = rx[i + prefix];
+    return result;
+}
+
+imu_status_t cBMI088::Write(const bsp::SpiDevice &device, uint8_t address, uint8_t value) {
+    const uint8_t tx[2]{static_cast<uint8_t>(address & 0x7F), value};
+    uint8_t rx[2]{};
+    return Exchange(device, tx, rx, sizeof(tx));
+}
+
+imu_status_t cBMI088::CheckId(const bsp::SpiDevice &device, bool accel) {
+    uint8_t id{};
+    const imu_status_t result = Read(device, accel, kChipId, &id, 1);
+    if (result != imu_status_t::ok) return result;
+    if (id == (accel ? kAccelChipId : kGyroChipId)) return imu_status_t::ok;
+    return accel ? imu_status_t::accel_id_error : imu_status_t::gyro_id_error;
+}
+
+imu_status_t cBMI088::ConfigureRegister(const bsp::SpiDevice &device, bool accel,
+                                        uint8_t address, uint8_t value,
+                                        uint8_t mask, uint32_t settle_ms) {
+    imu_status_t result = Write(device, address, value);
+    if (result != imu_status_t::ok) return result;
+    result = Delay(settle_ms);
+    if (result != imu_status_t::ok) return result;
+    uint8_t actual{};
+    result = Read(device, accel, address, &actual, 1);
+    if (result != imu_status_t::ok) return result;
+    return (actual & mask) == (value & mask) ? imu_status_t::ok : imu_status_t::config_error;
+}
+
+imu_status_t cBMI088::Config() {
+    initialized_ = false;
+    status_ = imu_status_t::not_initialized;
+    if (!PortsValid()) return Fail(imu_status_t::invalid_port);
+    Deselect();
+    operation_start_ms_ = clock_.now_ms(clock_.context);
+    operation_budget_ms_ = kConfigBudgetMs;
+    // Also permit Config immediately after board power-up, before the first ID.
+    imu_status_t result = Delay(80);
+    if (result != imu_status_t::ok) return Fail(result);
+
+    // First accel SPI read switches interface mode: discard its value, NOT errors.
+    uint8_t ignored{};
+    result = Read(accel_, true, kChipId, &ignored, 1);
+    if (result != imu_status_t::ok) return Fail(result);
+    result = Delay(1);
+    if (result != imu_status_t::ok) return Fail(result);
+    result = CheckId(accel_, true);
+    if (result != imu_status_t::ok) return Fail(result);
+    result = CheckId(gyro_, false);
+    if (result != imu_status_t::ok) return Fail(result);
+
+    result = Write(accel_, kAccelReset, kResetCommand);
+    if (result != imu_status_t::ok) return Fail(result);
+    result = Delay(50);
+    if (result != imu_status_t::ok) return Fail(result);
+    // Soft reset also resets interface selection; reselect SPI before ID/config.
+    result = Read(accel_, true, kChipId, &ignored, 1);
+    if (result != imu_status_t::ok) return Fail(result);
+    result = Delay(1);
+    if (result != imu_status_t::ok) return Fail(result);
+    result = CheckId(accel_, true);
+    if (result != imu_status_t::ok) return Fail(result);
+
+    result = Write(gyro_, kGyroReset, kResetCommand);
+    if (result != imu_status_t::ok) return Fail(result);
+    result = Delay(80);
+    if (result != imu_status_t::ok) return Fail(result);
+    result = CheckId(gyro_, false);
+    if (result != imu_status_t::ok) return Fail(result);
+
+    struct Setting { bool accel; uint8_t address, value, mask; uint32_t settle_ms; };
+    const Setting settings[]{
+        // Leave suspend BEFORE enabling the accel measurement engine.
+        {true, kAccelPowerConf, 0x00, 0xFF, 5},
+        {true, kAccelPowerCtrl, 0x04, 0xFF, 50},
+        {true, kAccelRange, 0x01, 0x03, 1},
+        {true, kAccelConf, kAccel400HzNormal, 0xFF, 40},
+        {false, kGyroPower, 0x00, 0xA0, 30},
+        {false, kGyroRange, 0x00, 0x07, 1},
+        // Bit7 is read-only in GYRO_BANDWIDTH; verify the documented BW field.
+        {false, kGyroBandwidth, kGyro400Hz47Hz, 0x0F, 10}
+    };
+    for (const Setting &setting : settings) {
+        result = ConfigureRegister(setting.accel ? accel_ : gyro_, setting.accel,
+                                   setting.address, setting.value, setting.mask,
+                                   setting.settle_ms);
+        if (result != imu_status_t::ok) return Fail(result);
+    }
+    initialized_ = true;
+    status_ = imu_status_t::ok;
+    return status_;
+}
+
+imu_status_t cBMI088::Update(imu_snapshot_t &out) {
+    // Clear caller's previous successful sample even if this call fails early.
+    out = {};
+    out.sequence = sequence_;
+    if (!initialized_) {
+        out.error = status_;
+        return status_;
+    }
+    operation_start_ms_ = clock_.now_ms(clock_.context);
+    operation_budget_ms_ = kUpdateBudgetMs;
+    uint8_t accel_bytes[6]{};
+    uint8_t gyro_bytes[6]{};
+    uint8_t temperature_bytes[2]{};
+    imu_status_t result = Read(accel_, true, kAccelData, accel_bytes, sizeof(accel_bytes));
+    if (result == imu_status_t::ok)
+        result = Read(gyro_, false, kGyroData, gyro_bytes, sizeof(gyro_bytes));
+    if (result == imu_status_t::ok)
+        result = Read(accel_, true, kTemperature, temperature_bytes, sizeof(temperature_bytes));
+    if (result != imu_status_t::ok) {
+        out.error = Fail(result);
+        return result;
+    }
+    imu_snapshot_t next{};
+    next.accel = Vector(accel_bytes, kAccelScale);
+    next.gyro = Vector(gyro_bytes, kGyroScale);
+    int32_t temperature = (static_cast<int32_t>(temperature_bytes[0]) << 3) |
+                          (temperature_bytes[1] >> 5);
+    if (temperature & 0x400) temperature -= 2048;
+    next.temperature_c = 23.0f + temperature * 0.125f;
+    next.timestamp_ms = clock_.now_ms(clock_.context);
+    next.sequence = ++sequence_;
+    next.error = imu_status_t::ok;
+    next.valid = true;
+    out = next;
+    status_ = imu_status_t::ok;
+    return status_;
+}
+} // namespace BMI088

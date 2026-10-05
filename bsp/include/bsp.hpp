@@ -1,20 +1,11 @@
-//
-// Created by cosmosmount on 2025/8/30.
-//
-
-#ifndef RM26_BSP_HPP
-#define RM26_BSP_HPP
-
-
-#ifdef __cplusplus
-extern  "C" {
-#endif
-
-    void bsp_Init(void);
-
-#ifdef __cplusplus
+#pragma once
+#include "bsp_ports.hpp"
+namespace bsp {
+Clock SystemClock(); // HAL tick and blocking sleep, inject RTOS sleep in services.
+SpiDevice ImuAccelPort();
+SpiDevice ImuGyroPort();
+DigitalOut LedRed();
+DigitalOut LedGreen();
+DigitalOut LedBlue();
+I2cPort MagnetometerPort();
 }
-#endif
-
-
-#endif //RM26_BSP_HPP

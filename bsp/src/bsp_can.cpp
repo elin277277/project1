@@ -1,50 +1,86 @@
 #include "bsp_can.hpp"
+#include "can.h"
+#include <atomic>
 
-extern CAN_HandleTypeDef hcan1;
-extern CAN_HandleTypeDef hcan2;
-
-/**
- * @brief 初始化CAN滤波器配置。
- * 设置CAN硬件的滤波器，用于优化接收数据的处理。
- * 更多信息，请参考原文，链接：https://blog.csdn.net/weixin_54448108/article/details/128570593
- */
-void CAN_Init(void)
-{
-    CAN_FilterTypeDef can_filter_st;                   ///< 定义过滤器结构体
-    can_filter_st.FilterActivation = ENABLE;           ///< ENABLE使能过滤器
-    can_filter_st.FilterMode = CAN_FILTERMODE_IDMASK;  ///< 设置过滤器模式--标识符屏蔽位模式
-    can_filter_st.FilterScale = CAN_FILTERSCALE_32BIT; ///< 过滤器的位宽 32 位
-    can_filter_st.FilterIdHigh = 0x0000;               ///< ID高位
-    can_filter_st.FilterIdLow = 0x0000;                ///< ID低位
-    can_filter_st.FilterMaskIdHigh = 0x0000;           ///< 过滤器掩码高位
-    can_filter_st.FilterMaskIdLow = 0x0000;            ///< 过滤器掩码低位
-
-    can_filter_st.FilterBank = 0;                                      ///< 过滤器组-双CAN可指定0~27
-    can_filter_st.FilterFIFOAssignment = CAN_RX_FIFO0;                 ///< 与过滤器组管理的 FIFO
-    HAL_CAN_ConfigFilter(&hcan1, &can_filter_st);                      ///< HAL库配置过滤器函数
-    HAL_CAN_Start(&hcan1);                                             ///< 使能CAN1控制器
-    HAL_CAN_ActivateNotification(&hcan1, CAN_IT_RX_FIFO0_MSG_PENDING); ///< 使能CAN的各种中断
-
-    can_filter_st.SlaveStartFilterBank = 14;                           ///< 双CAN模式下规定CAN的主从模式的过滤器分配，从过滤器为14
-    can_filter_st.FilterBank = 14;                                     ///< 过滤器组-双CAN可指定0~27
-    HAL_CAN_ConfigFilter(&hcan2, &can_filter_st);                      ///< HAL库配置过滤器函数
-    HAL_CAN_Start(&hcan2);                                             ///< 使能CAN2控制器
-    HAL_CAN_ActivateNotification(&hcan2, CAN_IT_RX_FIFO0_MSG_PENDING); ///< 使能CAN的各种中断
+namespace {
+using bsp::Status;
+struct Bus { CAN_HandleTypeDef *handle; bsp::CanReceive receive{}; void *context{}; bool started{}; std::atomic<uint32_t> errors{0}; };
+Bus buses[2]{{&hcan1},{&hcan2}};
+constexpr uint32_t allMailboxes=CAN_TX_MAILBOX0|CAN_TX_MAILBOX1|CAN_TX_MAILBOX2;
+Status status(HAL_StatusTypeDef s) {
+    return s==HAL_OK?Status::ok:s==HAL_BUSY?Status::busy:s==HAL_TIMEOUT?Status::timeout:Status::io_error;
 }
-
-void CAN_Transmit(CAN_HandleTypeDef *hcan, uint32_t Id, uint8_t *msg, uint16_t len)
-{
-    if (HAL_CAN_GetTxMailboxesFreeLevel(hcan) == 0)
-    {
-        // 如果邮箱已满，可以选择等待或者采取其他操作
-        // 例如，可以添加一个超时机制或者直接返回错误状态
-        // Monitor::instance()->Log_Messages(Monitor::WARNING, (uint8_t *)"CAN Tx Mailbox is full\r\n");
-        return;
+Status send(void *ctx, const bsp::CanFrame &frame) {
+    auto &bus=*static_cast<Bus *>(ctx);
+    const auto errors=bus.errors.load();
+    if(frame.extended || frame.remote || frame.id>0x7ff || frame.size>8) return Status::invalid;
+    if(!bus.started || HAL_CAN_GetState(bus.handle)!=HAL_CAN_STATE_LISTENING) return Status::not_ready;
+    if(HAL_CAN_GetError(bus.handle)&HAL_CAN_ERROR_BOF) return Status::io_error;
+    if(!HAL_CAN_GetTxMailboxesFreeLevel(bus.handle)) return Status::busy;
+    CAN_TxHeaderTypeDef header{};
+    header.StdId=frame.id; header.IDE=CAN_ID_STD; header.RTR=CAN_RTR_DATA; header.DLC=frame.size;
+    uint32_t mailbox{};
+    const auto result=status(HAL_CAN_AddTxMessage(bus.handle,&header,const_cast<uint8_t *>(frame.data),&mailbox));
+    // If an error IRQ interrupted submission, do not leave a just-enqueued
+    // command behind the ISR's abort request. Already-on-wire frames cannot be recalled.
+    if(bus.errors.load()!=errors) {
+        HAL_CAN_AbortTxRequest(bus.handle,allMailboxes);
+        return Status::io_error;
     }
-    // TODO: 校验标准帧 ID 和 DLC (0~8)，构造帧头并调用 HAL_CAN_AddTxMessage。
-    (void)Id;
-    (void)msg;
-    (void)len;
+    return result;
 }
-
-// TODO: 实现 CAN 接收回调，根据总线和标准帧 ID 分发电机反馈。
+Status start(void *ctx, bsp::CanReceive callback, void *receiver) {
+    auto &bus=*static_cast<Bus *>(ctx);
+    if(!callback)return Status::invalid;
+    if(bus.started) return Status::busy;
+    if(HAL_CAN_GetState(bus.handle)!=HAL_CAN_STATE_READY) return Status::not_ready;
+    CAN_FilterTypeDef filter{};
+    filter.FilterBank=bus.handle==&hcan1?0:14;
+    filter.SlaveStartFilterBank=14;
+    filter.FilterMode=CAN_FILTERMODE_IDMASK; filter.FilterScale=CAN_FILTERSCALE_32BIT;
+    filter.FilterFIFOAssignment=CAN_FILTER_FIFO0; filter.FilterActivation=ENABLE;
+    // Accept all frames, validate ID/type/DLC in the registered protocol consumer.
+    if(HAL_CAN_ConfigFilter(bus.handle,&filter)!=HAL_OK) return Status::io_error;
+    bus.receive=callback; bus.context=receiver;
+    if(HAL_CAN_Start(bus.handle)!=HAL_OK) return Status::io_error;
+    bus.started=true;
+    // NART is enabled by Board: a lost arbitration/error ends that attempt.
+    // Without TX/LEC notifications the dropped command looks like a success.
+    constexpr uint32_t flags=CAN_IT_RX_FIFO0_MSG_PENDING | CAN_IT_RX_FIFO0_OVERRUN |
+        CAN_IT_TX_MAILBOX_EMPTY | CAN_IT_LAST_ERROR_CODE | CAN_IT_ERROR_WARNING |
+        CAN_IT_ERROR_PASSIVE | CAN_IT_BUSOFF | CAN_IT_ERROR;
+    if(HAL_CAN_ActivateNotification(bus.handle,flags)!=HAL_OK) {
+        bus.started=false; HAL_CAN_Stop(bus.handle); return Status::io_error;
+    }
+    return Status::ok;
+}
+Bus *lookup(CAN_HandleTypeDef *h) { for(auto &b:buses) if(b.handle==h)return &b; return nullptr; }
+}
+namespace bsp {
+CanPort Can(unsigned bus) { return bus<2?CanPort{&buses[bus],send,start}:CanPort{}; }
+uint32_t CanErrors(unsigned bus) { return bus<2?buses[bus].errors.load():0; }
+Status CanAbort(unsigned bus) {
+    if(bus>=2)return Status::invalid;
+    if(!buses[bus].started)return Status::not_ready;
+    return status(HAL_CAN_AbortTxRequest(buses[bus].handle,allMailboxes));
+}
+}
+extern "C" void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *h) {
+    auto *bus=lookup(h); if(!bus)return;
+    // Hardware FIFO depth is three. Bound interrupt work under bus saturation.
+    for(unsigned i=0;i<3 && HAL_CAN_GetRxFifoFillLevel(h,CAN_RX_FIFO0);++i) {
+        CAN_RxHeaderTypeDef header{}; bsp::CanFrame frame{};
+        if(HAL_CAN_GetRxMessage(h,CAN_RX_FIFO0,&header,frame.data)!=HAL_OK) {++bus->errors; break;}
+        frame.extended=header.IDE!=CAN_ID_STD; frame.remote=header.RTR!=CAN_RTR_DATA;
+        frame.id=frame.extended?header.ExtId:header.StdId; frame.size=static_cast<uint8_t>(header.DLC);
+        if(bus->receive)bus->receive(bus->context,frame,HAL_GetTick());
+    }
+}
+extern "C" void HAL_CAN_ErrorCallback(CAN_HandleTypeDef *h) {
+    if(auto *bus=lookup(h)) {
+        ++bus->errors;
+        // Nonblocking register request: no retry, bus-off auto-recovery, or
+        // stale control mailboxes left queued after a detected transport fault.
+        HAL_CAN_AbortTxRequest(h,allMailboxes);
+    }
+}

@@ -1,21 +1,60 @@
 #include "M2006.hpp"
+#include <algorithm>
+#include <cmath>
 
-M2006::M2006()
+M2006::M2006(Config config)
+    : DJIMotor(config.reduction, config.currentLimit, config.feedbackTimeoutMs)
 {
-    // TODO: 根据 M2006 手册设置减速比、允许电流和速度/位置环 PID 参数。
-    // 基类初始化为松开模式、零电流；完成配置前不允许驱动电机。
+    // Zero gains and zero default current limit are intentional. No tuning or
+    // installed-hardware compatibility is implied by this protocol example.
 }
 
-void M2006::setOutput()
+void M2006::setOutput(float dtSeconds, uint32_t nowMs)
 {
-    // TODO: 分别实现松开、速度和位置模式；位置模式需要串联位置环与速度环。
-    // TODO: 将 PID 输出限制在 maxCurrent 范围内后写入 currentSet。
-    currentSet = 0;
+    if (!RefreshFeedback(nowMs) || !std::isfinite(dtSeconds) || dtSeconds <= 0.0f ||
+        dtSeconds > FeedbackTimeoutMs() * 0.001f ||
+        (controlMode != SPD_MODE && controlMode != POS_MODE))
+    {
+        Relax();
+        previousMode_ = RELAX_MODE;
+        return;
+    }
+    if (controlMode != previousMode_)
+    {
+        speedPid.Clear();
+        positionPid.Clear();
+        previousMode_ = controlMode;
+    }
+    float speedReference = speedSet;
+    if (controlMode == POS_MODE)
+    {
+        positionPid.ref = positionSet;
+        positionPid.fdb = motorFeedback.positionFdb;
+        if (!positionPid.UpdateResult(dtSeconds))
+        {
+            Relax();
+            return;
+        }
+        // Outer output is output-shaft rad/s; inner output is current counts.
+        // positionPid.maxOut is the service-configured output speed limit.
+        speedReference = positionPid.result;
+    }
+    speedPid.ref = speedReference;
+    speedPid.fdb = motorFeedback.speedFdb;
+    if (!speedPid.UpdateResult(dtSeconds) || !std::isfinite(speedPid.result))
+    {
+        Relax();
+        return;
+    }
+    const float limit = static_cast<float>(CurrentLimit());
+    // Clamp before float-to-integer conversion, including when callers changed
+    // public PID limits. The constructor limit can only be lowered at runtime.
+    currentSet = static_cast<int16_t>(Numeric::LimitABS(speedPid.result, limit));
+    CommitOutput();
 }
 
-M2006::MotorStateTypedef M2006::AliveCheck()
+M2006::MotorStateTypedef M2006::AliveCheck(uint32_t nowMs)
 {
-    // TODO: 比较 AliveFlag 与 Pre_AliveFlag，更新在线状态并保存本次计数。
-    MotorState = MOTOR_OFFLINE;
+    RefreshFeedback(nowMs);
     return MotorState;
 }
