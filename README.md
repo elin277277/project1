@@ -1,5 +1,20 @@
 # C 板框架大作业
 
+## 本仓库实现状态
+
+目标：RoboMaster C 型板 / STM32F407IGH6，**Board → BSP → Module → Service** 四层；保留原目录，Service位于 `threads/`，算法位于 `libs/`。Module使用可注入端口，不依赖HAL或ThreadX。
+
+- [构建与开关](docs/build.md)：入口 `board/`；默认不启动电机，逐层构建与主机测试。
+- [板级配置](docs/board.md)：参考指定旧工程的时钟，从空IOC重新生成，按官方C板接线核对。
+- [架构边界](docs/architecture.md) / [协作约定](AGENTS.md)。
+- **电机未确定**：[集中参数](threads/include/app_config.hpp) 标有 `// 改成实际电机`；[完整替换清单](docs/motor_changes.md)。M2006/C610仅为示例协议，不能直接用于任意电机。
+- [底盘推导](docs/chassis.md)、[SPI](docs/spi.md)、[I²C](docs/iic.md)、[参考资料](docs/refereces.md)。
+- [真实验证记录](docs/logs.md)：已进行本机生成、编译和假端口测试；尚未进行下载、外设波形或电机实测。构建成功不等于硬件验收。
+
+以下保留上游作业要求。
+
+---
+
 ## 概述
 
 大作业基于C板进行，并且自然地承接到后续小车控制的任务。我们希望通过这个作业让大家温习前面学过的所有知识，建立自己的嵌入式架构和知识体系，并为后续的嵌入式开发做好准备。请仔细阅读本文档以明确所有任务。
