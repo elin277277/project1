@@ -66,3 +66,9 @@ target_link_libraries(${CMAKE_PROJECT_NAME}
 
     # Add user defined libraries
 )
+
+# The first Board validation must not depend on BSP, modules, or an RTOS.
+option(BOARD_BUILD_APPLICATION "Build the upper-layer application" OFF)
+if(BOARD_BUILD_APPLICATION)
+    include(cmake/application.cmake)
+endif()
